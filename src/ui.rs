@@ -1007,7 +1007,7 @@ impl Studio {
             .child(hint("接入 RightAPI，使用 GPT Image 系列生成和编辑图片。"))
             .child(div().flex().flex_col().max_w(px(700.)).p_6().gap_5().rounded_xl().bg(rgb(0x20242c)).border_1().border_color(rgb(0x343b46))
                 .child(div().flex().flex_col().gap_2().child("API 地址").child(Input::new(&self.base_url)).child(hint("默认 https://rightapi.ai/v1，地址需包含 /v1。")))
-                .child(div().flex().flex_col().gap_2().child("API Key").child(Input::new(&self.key_input)).child(hint("密钥保存在 Windows 凭据管理器，不写入会话文件。留空保存可清除密钥。")))
+                .child(div().flex().flex_col().gap_2().child("API Key").child(Input::new(&self.key_input)).child(hint("密钥保存在系统凭据库（Windows 凭据管理器 / macOS 钥匙串），不写入会话文件。留空保存可清除密钥。")))
                 .child(div().flex().gap_3()
                     .child(Button::new("save-settings").primary().icon(IconName::Check).label("保存设置").on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx))))
                     .child(Button::new("back-to-work").outline().label("返回创作").on_click(cx.listener(|this, _, _, cx| { this.settings_open = false; cx.notify(); })))))

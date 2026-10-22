@@ -1,0 +1,96 @@
+name: Build desktop packages
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            # Make the portable EXE independent of the VC++ redistributable.
+            rustflags: -C target-feature=+crt-static
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            rustflags: ""
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python for packaging
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --target "${{ matrix.target }}"
+          rustup default stable
+          rustc --version --verbose
+
+      - name: Cache Cargo dependencies and release builds
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', '.github/workflows/build.yml') }}
+          restore-keys: |
+            cargo-${{ matrix.target }}-
+
+      - name: Check macOS build tools
+        if: runner.os == 'macOS'
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Run tests
+        run: cargo test --locked --release --target "${{ matrix.target }}"
+
+      - name: Build application
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Create distributable packages
+        run: python scripts/package.py --target "${{ matrix.target }}"
+
+      - name: Upload packages and checksums
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: AIDRAW-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+          # ZIP and DMG files are already compressed.
+          compression-level: 0

@@ -2,6 +2,8 @@
 
 `aidraw.png` is the generated source, used inside the application. `aidraw.ico` contains 16, 20, 24, 32, 40, 48, 64, 128 and 256 pixel variants and is embedded as Windows icon resource 1.
 
+The macOS packaging script generates `AIDRAW.icns` from the same PNG with native `sips` and `iconutil`, covering standard and Retina sizes from 16 to 1024 pixels.
+
 Generated with the connected RightAPI image tool, model `gpt-image-2`. The built-in image tool returned no artifact, so the connected image tool was used.
 
 Prompt:
