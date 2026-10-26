@@ -21,6 +21,8 @@ pub const SIZES: &[&str] = &[
     "2160x3840",
 ];
 pub const FORMATS: &[&str] = &["png", "jpeg", "webp"];
+pub const MAX_CONCURRENT_JOBS: usize = 3;
+pub const CUTOUT_PROMPT: &str = "抠图，移除背景，保留完整主体及细节，边缘干净自然，输出真正的透明背景；不要添加白底、阴影或棋盘格图案。";
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -115,8 +117,8 @@ pub fn validate_size(value: &str) -> Result<()> {
         || h == 0
         || w > 3840
         || h > 3840
-        || w % 16 != 0
-        || h % 16 != 0
+        || !w.is_multiple_of(16)
+        || !h.is_multiple_of(16)
         || w.max(h) > 3 * w.min(h)
         || !(655_360..=8_294_400).contains(&(w * h))
     {
@@ -130,19 +132,23 @@ pub enum Mode {
     #[default]
     Generate,
     Edit,
+    Batch,
 }
 
 impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Generate => "文生图",
-            Self::Edit => "图片编辑",
+            Self::Edit => "融合编辑",
+            Self::Batch => "批量处理",
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
+    Waiting,
+    Paused,
     Submitting,
     Queued,
     Processing,
@@ -161,12 +167,14 @@ impl Status {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Waiting => "等待处理",
+            Self::Paused => "已暂停 · 等待继续",
             Self::Submitting => "正在提交",
             Self::Queued => "排队中",
-            Self::Processing => "正在绘画",
+            Self::Processing => "正在处理",
             Self::Downloading => "正在保存图片",
             Self::Completed => "已完成",
-            Self::Failed => "生成失败",
+            Self::Failed => "处理失败",
             Self::Interrupted => "已暂停",
         }
     }
@@ -192,6 +200,31 @@ pub struct Drawing {
     pub task_id: Option<String>,
     pub images: Vec<ImageAsset>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub batch_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_name: Option<String>,
+}
+
+impl Drawing {
+    pub fn can_resume(&self) -> bool {
+        self.status == Status::Paused
+            || (matches!(self.status, Status::Failed | Status::Interrupted)
+                && self.task_id.is_some())
+    }
+}
+
+pub fn reference_name(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if name.len() > 37
+        && name.is_char_boundary(36)
+        && name.as_bytes()[36] == b'-'
+        && Uuid::parse_str(&name[..36]).is_ok()
+    {
+        name[37..].to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -202,6 +235,10 @@ pub struct Session {
     pub created_at: u64,
     #[serde(default)]
     pub draft: String,
+    #[serde(default)]
+    pub mode: Mode,
+    #[serde(default)]
+    pub references: Vec<PathBuf>,
     pub drawings: Vec<Drawing>,
 }
 
@@ -213,6 +250,8 @@ impl Default for Session {
             named: false,
             created_at: now(),
             draft: String::new(),
+            mode: Mode::Batch,
+            references: vec![],
             drawings: vec![],
         }
     }
@@ -239,6 +278,73 @@ impl Default for Library {
 }
 
 impl Library {
+    /// A batch creates one independent edit per source. Fusion keeps all references together.
+    pub fn enqueue(
+        &mut self,
+        prompt: &str,
+        mode: Mode,
+        references: &[PathBuf],
+    ) -> Result<Vec<Uuid>> {
+        if prompt.trim().is_empty() {
+            bail!("请先填写处理指令");
+        }
+        self.settings.validate()?;
+        if mode != Mode::Generate && references.is_empty() {
+            bail!("请先添加需要处理的图片");
+        }
+        let groups = match mode {
+            Mode::Batch => references.iter().map(|p| vec![p.clone()]).collect(),
+            Mode::Edit => vec![references.to_vec()],
+            Mode::Generate => vec![vec![]],
+        };
+        let batch_id = (mode == Mode::Batch).then(Uuid::new_v4);
+        let settings = self.settings.clone();
+        let session = self.active_mut();
+        if !session.named && session.drawings.is_empty() {
+            session.title = prompt.chars().take(22).collect();
+        }
+        let mut ids = Vec::new();
+        for references in groups {
+            let id = Uuid::new_v4();
+            let source_name = references.first().map(|p| reference_name(p));
+            session.drawings.push(Drawing {
+                id,
+                prompt: prompt.trim().into(),
+                mode,
+                settings: settings.clone(),
+                references,
+                created_at: now(),
+                status: Status::Waiting,
+                progress: 0,
+                task_id: None,
+                images: vec![],
+                error: None,
+                batch_id,
+                source_name,
+            });
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    pub fn waiting_ids(&self) -> Vec<Uuid> {
+        let mut drawings: Vec<_> = self
+            .sessions
+            .iter()
+            .flat_map(|s| &s.drawings)
+            .filter(|d| d.status == Status::Waiting)
+            .collect();
+        drawings.sort_by_key(|d| d.created_at);
+        drawings.into_iter().map(|d| d.id).collect()
+    }
+
+    pub fn ready_ids(&self, running: usize) -> Vec<Uuid> {
+        self.waiting_ids()
+            .into_iter()
+            .take(MAX_CONCURRENT_JOBS.saturating_sub(running))
+            .collect()
+    }
+
     pub fn active(&self) -> &Session {
         self.sessions
             .iter()
@@ -268,7 +374,9 @@ impl Library {
             self.active_session = self.sessions[0].id;
         }
         for drawing in self.sessions.iter_mut().flat_map(|s| &mut s.drawings) {
-            if drawing.status.active() {
+            if drawing.status == Status::Waiting {
+                drawing.status = Status::Paused;
+            } else if drawing.status.active() {
                 drawing.status = Status::Interrupted;
                 drawing.error = Some(if drawing.task_id.is_some() {
                     "应用已关闭。点击「继续查询」可找回任务结果，不会重复提交。".into()
@@ -286,6 +394,48 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn export_completed(
+        drawings: &[Drawing],
+        directory: &Path,
+    ) -> Result<(PathBuf, usize, usize)> {
+        let folder = directory.join(format!(
+            "AIDRAW-{}-{}",
+            now(),
+            &Uuid::new_v4().to_string()[..8]
+        ));
+        fs::create_dir(&folder).context("无法创建导出目录")?;
+        let mut saved = 0;
+        let mut failed = 0;
+        for drawing in drawings.iter().filter(|d| d.status == Status::Completed) {
+            for image in &drawing.images {
+                let stem = drawing
+                    .source_name
+                    .as_deref()
+                    .and_then(|name| Path::new(name).file_stem())
+                    .unwrap_or_else(|| std::ffi::OsStr::new("AIDRAW"))
+                    .to_string_lossy();
+                let extension = image
+                    .path
+                    .extension()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("png"));
+                let target = folder.join(format!(
+                    "{}-{}.{}",
+                    stem,
+                    image.id,
+                    extension.to_string_lossy()
+                ));
+                match fs::read(&image.path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|bytes| atomic_write(&target, &bytes))
+                {
+                    Ok(()) => saved += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+        }
+        Ok((folder, saved, failed))
+    }
+
     pub fn open() -> Result<Self> {
         let root = match std::env::var_os("AIDRAW_DATA_DIR") {
             Some(value) => PathBuf::from(value),
@@ -335,10 +485,18 @@ impl Store {
             .with_guessed_format()?
             .into_dimensions()
             .context("无法识别参考图片")?;
-        let target = self
-            .root
-            .join("references")
-            .join(format!("{}.{}", Uuid::new_v4(), extension));
+        let target = self.root.join("references").join(format!(
+            "{}-{}.{}",
+            Uuid::new_v4(),
+            source
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .chars()
+                .take(80)
+                .collect::<String>(),
+            extension
+        ));
         fs::copy(source, &target).context("无法导入参考图")?;
         Ok(target)
     }
@@ -376,6 +534,158 @@ pub fn load_api_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arbitrary_batch_counts_keep_prompts_and_sources_independent() {
+        for count in [1, 7, 30, 42, 101] {
+            let mut library = Library::default();
+            let sources: Vec<_> = (0..count)
+                .map(|i| PathBuf::from(format!("product-{i}.png")))
+                .collect();
+            let ids = library
+                .enqueue("统一调整为蓝色背景，保留主体", Mode::Batch, &sources)
+                .unwrap();
+            assert_eq!(ids.len(), count);
+            let drawings = &library.active().drawings;
+            for (index, drawing) in drawings.iter().enumerate() {
+                assert_eq!(drawing.references, vec![sources[index].clone()]);
+                assert_eq!(drawing.prompt, "统一调整为蓝色背景，保留主体");
+                assert!(drawing.mode == Mode::Batch && drawing.status == Status::Waiting);
+                assert_eq!(drawing.batch_id, drawings[0].batch_id);
+                assert!(drawing.batch_id.is_some());
+            }
+            assert_eq!(
+                ids.iter().collect::<std::collections::HashSet<_>>().len(),
+                count
+            );
+            library.settings.format = "jpeg".into();
+            assert_eq!(library.active().drawings[0].settings.format, "png");
+        }
+    }
+
+    #[test]
+    fn fusion_stays_one_job_and_invalid_batches_leave_no_records() {
+        let mut library = Library::default();
+        assert!(library.enqueue("换背景", Mode::Batch, &[]).is_err());
+        assert!(library.enqueue("   ", Mode::Generate, &[]).is_err());
+        assert!(library.active().drawings.is_empty());
+        let sources = vec![PathBuf::from("one.png"), PathBuf::from("two.webp")];
+        assert_eq!(
+            library
+                .enqueue("融合两张图", Mode::Edit, &sources)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(library.active().drawings[0].references, sources);
+        assert!(library.active().drawings[0].batch_id.is_none());
+    }
+
+    #[test]
+    fn queue_capacity_and_failures_do_not_block_following_images() {
+        let mut library = Library::default();
+        let sources: Vec<_> = (0..42).map(|i| PathBuf::from(format!("{i}.png"))).collect();
+        let ids = library.enqueue("自由修改", Mode::Batch, &sources).unwrap();
+        assert_eq!(library.ready_ids(0), ids[..3]);
+        for id in &ids[..3] {
+            library.drawing_mut(*id).unwrap().status = Status::Processing;
+        }
+        assert!(library.ready_ids(3).is_empty());
+        assert!(library.ready_ids(4).is_empty());
+        library.drawing_mut(ids[0]).unwrap().status = Status::Failed;
+        assert_eq!(library.ready_ids(2), vec![ids[3]]);
+        library.drawing_mut(ids[3]).unwrap().status = Status::Paused;
+        assert_eq!(library.ready_ids(2), vec![ids[4]]);
+    }
+
+    #[test]
+    fn restart_preserves_batch_drafts_and_never_resubmits_uncertain_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().into()).unwrap();
+        let mut library = Library::default();
+        let ids = library
+            .enqueue(
+                "换背景",
+                Mode::Batch,
+                &["a.png".into(), "b.png".into(), "c.png".into()],
+            )
+            .unwrap();
+        library.drawing_mut(ids[0]).unwrap().status = Status::Submitting;
+        let drawing = library.drawing_mut(ids[1]).unwrap();
+        drawing.status = Status::Processing;
+        drawing.task_id = Some("known-id".into());
+        library.active_mut().references = vec!["draft.webp".into()];
+        library.active_mut().mode = Mode::Batch;
+        store.save(&library).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.active().mode == Mode::Batch);
+        assert_eq!(
+            loaded.active().references,
+            vec![PathBuf::from("draft.webp")]
+        );
+        let drawings = &loaded.active().drawings;
+        assert!(!drawings[0].can_resume());
+        assert!(drawings[1].can_resume());
+        assert!(drawings[2].status == Status::Paused && drawings[2].can_resume());
+        assert!(loaded.waiting_ids().is_empty());
+        assert_eq!(drawings[1].task_id.as_deref(), Some("known-id"));
+    }
+
+    #[test]
+    fn bulk_export_preserves_alpha_names_and_reports_missing_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("cache")).unwrap();
+        let source = directory.path().join("product.png");
+        image::DynamicImage::new_rgba8(2, 2).save(&source).unwrap();
+        let imported = store.import_reference(&source).unwrap();
+        assert_eq!(reference_name(&imported), "product.png");
+        let mut library = Library::default();
+        let ids = library
+            .enqueue("更换背景", Mode::Batch, &[imported])
+            .unwrap();
+        let drawing = library.drawing_mut(ids[0]).unwrap();
+        drawing.status = Status::Completed;
+        drawing.images = vec![
+            ImageAsset {
+                id: Uuid::new_v4(),
+                path: source.clone(),
+                url: String::new(),
+            },
+            ImageAsset {
+                id: Uuid::new_v4(),
+                path: directory.path().join("missing.png"),
+                url: String::new(),
+            },
+        ];
+        let (folder, saved, failed) =
+            Store::export_completed(&library.active().drawings, directory.path()).unwrap();
+        assert_eq!((saved, failed), (1, 1));
+        let exported = fs::read_dir(&folder)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            exported
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("product-")
+        );
+        assert_eq!(fs::read(&exported).unwrap(), fs::read(&source).unwrap());
+        assert_eq!(
+            image::open(exported).unwrap().to_rgba8().get_pixel(0, 0).0[3],
+            0
+        );
+        assert!(source.exists());
+        assert_ne!(
+            folder,
+            Store::export_completed(&library.active().drawings, directory.path())
+                .unwrap()
+                .0
+        );
+    }
 
     #[test]
     fn migrates_retired_model_choices_and_accepts_requested_models() {
@@ -445,6 +755,8 @@ mod tests {
             task_id: Some("task_123".into()),
             images: vec![],
             error: None,
+            batch_id: None,
+            source_name: None,
         });
         store.save(&library).unwrap();
         library.active_mut().title = "修改后的标题".into();

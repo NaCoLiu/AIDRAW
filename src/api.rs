@@ -182,7 +182,10 @@ impl Api {
                 .json(&json!({"model": settings.model, "prompt": job.prompt, "async": true,
                     "n": 1, "size": settings.size, "quality": settings.quality, "output_format": settings.format}))
                 .send().context("无法连接 RightAPI")?,
-            Mode::Edit => {
+            Mode::Edit | Mode::Batch => {
+                if job.mode == Mode::Batch && job.references.len() != 1 {
+                    bail!("批量任务必须且只能包含一张原图");
+                }
                 if job.references.is_empty() { bail!("图片编辑至少需要一张参考图"); }
                 let mut form = multipart::Form::new().text("model", settings.model.clone())
                     .text("prompt", job.prompt.clone()).text("async", "true").text("n", "1")
@@ -544,6 +547,73 @@ mod tests {
         assert_eq!(requests[0].matches("name=\"image\"").count(), 2);
         assert!(requests[0].contains("name=\"async\"\r\n\r\ntrue"));
         assert!(requests[0].contains("Content-Type: image/png"));
+    }
+
+    #[test]
+    fn batch_sends_42_separate_edits_with_custom_instruction_and_survives_one_error() {
+        let responses = (0..42)
+            .map(|index| {
+                if index == 5 {
+                    (
+                        400,
+                        "application/json".into(),
+                        br#"{"error":{"message":"invalid source"}}"#.to_vec(),
+                    )
+                } else {
+                    json_response(json!({"task_id": format!("batch-{index}"), "status": "queued"}))
+                }
+            })
+            .collect();
+        let (base, handle) = server(responses);
+        let directory = tempfile::tempdir().unwrap();
+        let mut library = crate::model::Library::default();
+        library.settings.base_url = format!("{base}/v1");
+        let sources: Vec<_> = (0..42)
+            .map(|index| {
+                let path = directory.path().join(format!("product-{index}.png"));
+                std::fs::write(&path, format!("source-{index}")).unwrap();
+                path
+            })
+            .collect();
+        library
+            .enqueue("将背景替换为蓝色渐变，保留主体", Mode::Batch, &sources)
+            .unwrap();
+        let api = Api::new().unwrap();
+        let mut accepted = 0;
+        for drawing in &library.active().drawings {
+            let request = Job {
+                drawing_id: drawing.id,
+                settings: drawing.settings.clone(),
+                prompt: drawing.prompt.clone(),
+                mode: drawing.mode,
+                references: drawing.references.clone(),
+                resume_task: None,
+                image_dir: directory.path().into(),
+            };
+            accepted += usize::from(api.submit(&request, "test-key").is_ok());
+        }
+        assert_eq!(accepted, 41);
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 42);
+        for (index, request) in requests.iter().enumerate() {
+            assert!(request.starts_with("POST /v1/images/edits"));
+            assert_eq!(request.matches("name=\"image\"").count(), 1);
+            assert!(request.contains("将背景替换为蓝色渐变，保留主体"));
+            assert!(request.contains(&format!("source-{index}\r\n")));
+        }
+    }
+
+    #[test]
+    fn batch_rejects_combined_sources_before_sending() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut request = job("http://127.0.0.1:1", directory.path());
+        request.mode = Mode::Batch;
+        request.references = vec!["one.png".into(), "two.png".into()];
+        let error = Api::new()
+            .unwrap()
+            .submit(&request, "test-key")
+            .unwrap_err();
+        assert!(error.to_string().contains("只能包含一张原图"));
     }
 
     #[test]

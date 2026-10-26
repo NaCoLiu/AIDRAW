@@ -25,3 +25,22 @@ pub fn app_icon() -> Arc<Image> {
     })
     .clone()
 }
+
+pub fn transparency_grid() -> Arc<Image> {
+    static GRID: OnceLock<Arc<Image>> = OnceLock::new();
+    GRID.get_or_init(|| {
+        let pixels = image::RgbImage::from_fn(440, 220, |x, y| {
+            image::Rgb(if (x / 22 + y / 22) % 2 == 0 {
+                [60, 70, 82]
+            } else {
+                [48, 57, 67]
+            })
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("Failed to create transparency grid");
+        Arc::new(Image::from_bytes(ImageFormat::Png, bytes.into_inner()))
+    })
+    .clone()
+}

@@ -37,7 +37,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(1060.0), px(760.0))),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("AIDRAW · 三只猫专用图像工作室".into()),
+                        title: Some("AIDRAW · 图像批量创作工作台".into()),
                         ..Default::default()
                     }),
                     ..Default::default()

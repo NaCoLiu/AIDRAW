@@ -1,14 +1,14 @@
 use crate::{
     api::{self, Event, Job},
     model::{
-        self, Drawing, FORMATS, ImageAsset, Library, MODELS, Mode, QUALITIES, SIZES, Session,
-        Status, Store,
+        self, CUTOUT_PROMPT, Drawing, FORMATS, ImageAsset, Library, MODELS, Mode, QUALITIES, SIZES,
+        Session, Status, Store,
     },
 };
 use gpui_kit::{
     assets::IconName,
     component::{
-        ActiveTheme, Disableable, Icon, IndexPath, Selectable, Sizable,
+        Disableable, Icon, IndexPath, Selectable, Sizable,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         progress::Progress,
@@ -46,6 +46,29 @@ enum DeleteTarget {
     Drawing(Uuid),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ResultFilter {
+    #[default]
+    All,
+    Pending,
+    Completed,
+    Attention,
+}
+
+impl ResultFilter {
+    fn matches(self, drawing: &Drawing) -> bool {
+        match self {
+            Self::All => true,
+            Self::Pending => {
+                drawing.status.active()
+                    || matches!(drawing.status, Status::Waiting | Status::Paused)
+            }
+            Self::Completed => drawing.status == Status::Completed,
+            Self::Attention => matches!(drawing.status, Status::Failed | Status::Interrupted),
+        }
+    }
+}
+
 pub struct Studio {
     library: Library,
     store: Option<Store>,
@@ -69,6 +92,8 @@ pub struct Studio {
     renaming: bool,
     deleting: Option<DeleteTarget>,
     importing: bool,
+    exporting: bool,
+    filter: ResultFilter,
     running: HashMap<Uuid, Arc<AtomicBool>>,
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
@@ -93,6 +118,14 @@ fn hint(text: impl Into<SharedString>) -> Div {
     div().text_xs().text_color(rgb(0x929ba9)).child(text.into())
 }
 
+fn prompt_placeholder(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Batch => "描述所有图片要应用的修改，例如：统一换成浅灰背景，保留主体与自然阴影。",
+        Mode::Edit => "描述如何修改或融合这些参考图，将生成一份结果。",
+        Mode::Generate => "描述想创作的画面：主体、场景、光线、构图和风格……",
+    }
+}
+
 impl Studio {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (store, library, storage_error) = match Store::open() {
@@ -106,7 +139,7 @@ impl Studio {
         let api_key = model::load_api_key();
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("描述你想创作的画面：主体、场景、光线、构图和风格……")
+                .placeholder(prompt_placeholder(library.active().mode))
                 .default_value(library.active().draft.clone())
                 .rows(3)
         });
@@ -153,6 +186,8 @@ impl Studio {
                 .default_value(height)
         });
         let format = choice(FORMATS, &settings.format, window, cx);
+        let mode = library.active().mode;
+        let references = library.active().references.clone();
         let mut subscriptions = vec![cx.subscribe_in(&prompt, window, |this, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
                 this.library.active_mut().draft = this.prompt.read(cx).value().to_string();
@@ -233,12 +268,14 @@ impl Studio {
             custom_width,
             custom_height,
             format,
-            mode: Mode::Generate,
-            references: vec![],
+            mode,
+            references,
             settings_open: false,
             renaming: false,
             deleting: None,
             importing: false,
+            exporting: false,
+            filter: ResultFilter::All,
             running: HashMap::new(),
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -255,6 +292,8 @@ impl Studio {
     }
 
     fn persist(&mut self) -> bool {
+        self.library.active_mut().mode = self.mode;
+        self.library.active_mut().references = self.references.clone();
         if self.storage_error.is_some() {
             return false;
         }
@@ -286,6 +325,8 @@ impl Studio {
             return;
         }
         self.library.active_mut().draft = self.prompt.read(cx).value().to_string();
+        self.library.active_mut().mode = self.mode;
+        self.library.active_mut().references = self.references.clone();
         self.library.active_session = id;
         let draft = self.library.active().draft.clone();
         let title = self.library.active().title.clone();
@@ -294,16 +335,22 @@ impl Studio {
         self.title
             .update(cx, |s, cx| s.set_value(title, window, cx));
         self.renaming = false;
+        self.filter = ResultFilter::All;
         self.settings_open = false;
         self.deleting = None;
-        self.references.clear();
-        self.mode = Mode::Generate;
+        self.references = self.library.active().references.clone();
+        self.mode = self.library.active().mode;
+        self.prompt.update(cx, |s, cx| {
+            s.set_placeholder(prompt_placeholder(self.mode), window, cx)
+        });
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.persist();
         cx.notify();
     }
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.library.active_mut().draft = self.prompt.read(cx).value().to_string();
+        self.library.active_mut().mode = self.mode;
+        self.library.active_mut().references = self.references.clone();
         let session = Session::default();
         let id = session.id;
         self.library.sessions.insert(0, session);
@@ -380,7 +427,7 @@ impl Studio {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("选择参考图片（PNG / JPEG / WebP）".into()),
+            prompt: Some("添加图片 · 支持多选 PNG / JPEG / WebP".into()),
         });
         let session_id = self.library.active_session;
         self.importing = true;
@@ -390,26 +437,53 @@ impl Studio {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        paths
-                            .iter()
-                            .map(|path| store.import_reference(path))
-                            .collect::<anyhow::Result<Vec<_>>>()
+                        let mut imported = Vec::new();
+                        let mut errors = Vec::new();
+                        for path in paths {
+                            match store.import_reference(&path) {
+                                Ok(path) => imported.push(path),
+                                Err(error) => errors
+                                    .push(format!("{}：{error:#}", model::reference_name(&path))),
+                            }
+                        }
+                        (imported, errors)
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     this.importing = false;
-                    match result {
-                        Ok(paths) => {
-                            if this.library.active_session != session_id {
-                                this.message(false, "会话已切换，请在目标会话重新添加参考图", cx);
-                                return;
+                    let (paths, errors) = result;
+                    if this.library.active_session != session_id {
+                        if let Some(session) = this
+                            .library
+                            .sessions
+                            .iter_mut()
+                            .find(|s| s.id == session_id)
+                        {
+                            session.references.extend(paths);
+                            if session.mode == Mode::Generate {
+                                session.mode = Mode::Batch;
                             }
-                            this.references.extend(paths);
-                            this.mode = Mode::Edit;
-                            cx.notify();
+                            this.persist();
                         }
-                        Err(e) => this.message(true, format!("导入失败：{e:#}"), cx),
+                        this.message(!errors.is_empty(), "图片已添加至原项目，可切回查看", cx);
+                        return;
                     }
+                    let count = paths.len();
+                    this.references.extend(paths);
+                    if this.mode == Mode::Generate {
+                        this.mode = Mode::Batch;
+                    }
+                    this.persist();
+                    let message = if errors.is_empty() {
+                        format!("已添加 {count} 张图片，填写统一指令即可开始")
+                    } else {
+                        format!(
+                            "已添加 {count} 张，{} 张无法导入：{}",
+                            errors.len(),
+                            errors.into_iter().take(3).collect::<Vec<_>>().join("；")
+                        )
+                    };
+                    this.message(count == 0, message, cx);
                 });
             }
             result => {
@@ -430,12 +504,12 @@ impl Studio {
             self.message(true, "请先修复本地数据目录，原会话文件已保留。", cx);
             return;
         }
-        if self.session_busy() {
+        if self.importing {
             return;
         }
         let prompt = self.prompt.read(cx).value().trim().to_string();
         if prompt.is_empty() {
-            self.message(true, "先写下你的创作提示词", cx);
+            self.message(true, "请描述你想生成的画面或希望对图片进行的修改", cx);
             self.prompt.update(cx, |s, cx| s.focus(window, cx));
             return;
         }
@@ -444,47 +518,84 @@ impl Studio {
             self.message(true, "请填写 RightAPI API Key 并保存设置", cx);
             return;
         }
-        if self.mode == Mode::Edit && self.references.is_empty() {
-            self.message(true, "请先添加参考图，或点击已有图片的「编辑此图」", cx);
+        if self.mode != Mode::Generate && self.references.is_empty() {
+            self.message(true, "先添加图片，再填写希望应用的处理指令", cx);
             return;
         }
         if let Err(e) = self.library.settings.validate() {
             self.message(true, e.to_string(), cx);
             return;
         }
-        let references = if self.mode == Mode::Edit {
-            self.references.clone()
-        } else {
-            vec![]
-        };
-        let drawing = Drawing {
-            id: Uuid::new_v4(),
-            prompt: prompt.clone(),
-            mode: self.mode,
-            settings: self.library.settings.clone(),
-            references,
-            created_at: model::now(),
-            status: Status::Submitting,
-            progress: 0,
-            task_id: None,
-            images: vec![],
-            error: None,
-        };
-        let session = self.library.active_mut();
-        if !session.named && session.drawings.is_empty() {
-            session.title = prompt.chars().take(22).collect();
-        }
-        let job = self.job(&drawing);
-        self.library.active_mut().drawings.push(drawing);
-        self.notice = None;
-        let saved = self.persist();
-        if !saved {
-            if let Some(drawing) = self.library.active_mut().drawings.last_mut() {
-                drawing.status = Status::Failed;
-                drawing.error = Some("本地记录保存失败，尚未提交到服务端".into());
+        let before = self.library.clone();
+        let ids = match self.library.enqueue(&prompt, self.mode, &self.references) {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.message(true, error.to_string(), cx);
+                return;
             }
-        } else if let Some(job) = job {
-            self.start(job, cx);
+        };
+        self.notice = None;
+        self.filter = ResultFilter::All;
+        if !self.persist() {
+            self.library = before;
+        } else {
+            if self.mode != Mode::Generate {
+                self.references.clear();
+            }
+            self.persist();
+            self.message(
+                false,
+                format!("{} 个任务已加入队列，将自动处理并保存结果", ids.len()),
+                cx,
+            );
+            self.pump_queue(cx);
+        }
+        cx.notify();
+    }
+
+    fn pump_queue(&mut self, cx: &mut Context<Self>) {
+        if self.storage_error.is_some() || self.api_key.trim().is_empty() {
+            return;
+        }
+        for id in self.library.ready_ids(self.running.len()) {
+            let drawing = self.library.drawing_mut(id).cloned().unwrap();
+            if let Some(job) = self.job(&drawing) {
+                self.library.drawing_mut(id).unwrap().status = Status::Submitting;
+                if !self.persist() {
+                    self.library.drawing_mut(id).unwrap().status = Status::Paused;
+                    break;
+                }
+                self.start(job, cx);
+            }
+        }
+    }
+
+    fn pause_queue(&mut self, cx: &mut Context<Self>) {
+        for drawing in &mut self.library.active_mut().drawings {
+            if drawing.status == Status::Waiting {
+                drawing.status = Status::Paused;
+            }
+        }
+        self.persist();
+        self.message(false, "后续任务已暂停，正在处理的图片会继续完成", cx);
+    }
+
+    fn continue_queue(&mut self, cx: &mut Context<Self>) {
+        if self.api_key.trim().is_empty() {
+            self.settings_open = true;
+            return;
+        }
+        let before = self.library.clone();
+        for drawing in &mut self.library.active_mut().drawings {
+            if drawing.can_resume() && !self.running.contains_key(&drawing.id) {
+                drawing.status = Status::Waiting;
+                drawing.error = None;
+            }
+        }
+        if self.persist() {
+            self.pump_queue(cx);
+        } else {
+            self.library = before;
         }
         cx.notify();
     }
@@ -542,11 +653,11 @@ impl Studio {
                             }
                             this.persist();
                             cx.notify();
-                        } else if let Event::Completed(images) = event {
-                            if let Some(store) = &this.store {
-                                for image in &images {
-                                    let _ = store.remove_generated(image);
-                                }
+                        } else if let Event::Completed(images) = event
+                            && let Some(store) = &this.store
+                        {
+                            for image in &images {
+                                let _ = store.remove_generated(image);
                             }
                         }
                     })
@@ -557,6 +668,7 @@ impl Studio {
             }
             let _ = this.update(cx, |this, cx| {
                 this.running.remove(&id);
+                this.pump_queue(cx);
                 cx.notify();
             });
         })
@@ -579,16 +691,20 @@ impl Studio {
             .find(|d| d.id == id)
             .cloned();
         if let Some(drawing) = drawing {
-            if drawing.task_id.is_none() || self.running.contains_key(&id) {
+            if !drawing.can_resume() || self.running.contains_key(&id) {
                 return;
             }
-            if let Some(job) = self.job(&drawing) {
+            {
+                let previous = self.library.clone();
                 if let Some(d) = self.library.drawing_mut(id) {
-                    d.status = Status::Processing;
+                    d.status = Status::Waiting;
                     d.error = None;
                 }
-                self.persist();
-                self.start(job, cx);
+                if self.persist() {
+                    self.pump_queue(cx);
+                } else {
+                    self.library = previous;
+                }
                 cx.notify();
             }
         }
@@ -598,8 +714,17 @@ impl Studio {
             cancel.store(true, Ordering::Relaxed);
         }
         if let Some(d) = self.library.drawing_mut(id) {
-            d.status = Status::Interrupted;
-            d.error = Some("已暂停本地查询，服务端任务仍可能运行。可继续查询以获取结果。".into());
+            if d.status != Status::Waiting && !d.status.active() {
+                return;
+            }
+            if d.status == Status::Waiting {
+                d.status = Status::Paused;
+                d.error = None;
+            } else {
+                d.status = Status::Interrupted;
+                d.error =
+                    Some("已暂停本地查询，服务端任务仍可能运行。可继续查询以获取结果。".into());
+            }
         }
         self.persist();
         cx.notify();
@@ -611,6 +736,7 @@ impl Studio {
         });
         self.mode = drawing.mode;
         self.references = drawing.references;
+        self.persist();
         cx.notify();
     }
     fn edit_image(&mut self, image: ImageAsset, window: &mut Window, cx: &mut Context<Self>) {
@@ -626,6 +752,7 @@ impl Studio {
                     s.focus(window, cx);
                 });
                 self.message(false, "已添加原图，请描述需要保留的内容和想修改的部分", cx);
+                self.persist();
             }
             Err(e) => self.message(true, format!("无法使用这张图片：{e:#}"), cx),
         }
@@ -671,11 +798,100 @@ impl Studio {
         })
         .detach();
     }
+    fn export_all(&mut self, cx: &mut Context<Self>) {
+        if self.exporting {
+            return;
+        }
+        let drawings: Vec<_> = self
+            .library
+            .active()
+            .drawings
+            .iter()
+            .filter(|d| d.status == Status::Completed && !d.images.is_empty())
+            .cloned()
+            .collect();
+        if drawings.is_empty() {
+            self.message(false, "还没有可导出的结果", cx);
+            return;
+        }
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择保存位置".into()),
+        });
+        self.exporting = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = match picker.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                    let directory = paths[0].clone();
+                    Some(
+                        cx.background_executor()
+                            .spawn(async move { Store::export_completed(&drawings, &directory) })
+                            .await,
+                    )
+                }
+                Ok(Err(error)) => Some(Err(error)),
+                Err(error) => Some(Err(error.into())),
+                _ => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.exporting = false;
+                match result {
+                    Some(Ok((folder, saved, failed))) => this.message(
+                        failed > 0,
+                        format!(
+                            "已导出 {saved} 张，{failed} 张未能保存。保存位置：{}",
+                            folder.display()
+                        ),
+                        cx,
+                    ),
+                    Some(Err(error)) => this.message(true, format!("导出失败：{error:#}"), cx),
+                    None => cx.notify(),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = mode;
+        self.prompt.update(cx, |s, cx| {
+            s.set_placeholder(prompt_placeholder(mode), window, cx)
+        });
+        self.persist();
+        cx.notify();
+    }
+
+    fn preset(
+        &mut self,
+        prompt: &'static str,
+        transparent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_mode(Mode::Batch, window, cx);
+        self.prompt.update(cx, |s, cx| {
+            s.set_value(prompt, window, cx);
+            s.focus(window, cx);
+        });
+        if transparent {
+            self.library.settings.format = "png".into();
+            self.format.update(cx, |s, cx| {
+                s.set_selected_value(&SharedString::from("png"), window, cx)
+            });
+        }
+        self.persist();
+        cx.notify();
+    }
     fn delete_confirmed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.deleting.take() else {
             return;
         };
         let before = self.library.clone();
+        let previous_mode = self.mode;
+        let previous_references = self.references.clone();
         let drawings = match target {
             DeleteTarget::Drawing(id) => {
                 let session = self.library.active_mut();
@@ -699,8 +915,14 @@ impl Studio {
                 session.drawings
             }
         };
+        if matches!(target, DeleteTarget::Session(_)) {
+            self.references = self.library.active().references.clone();
+            self.mode = self.library.active().mode;
+        }
         if !self.persist() {
             self.library = before;
+            self.mode = previous_mode;
+            self.references = previous_references;
             cx.notify();
             return;
         }
@@ -716,8 +938,8 @@ impl Studio {
             self.title.update(cx, |s, cx| {
                 s.set_value(self.library.active().title.clone(), window, cx)
             });
-            self.references.clear();
-            self.mode = Mode::Generate;
+            self.references = self.library.active().references.clone();
+            self.mode = self.library.active().mode;
             self.renaming = false;
         }
         if let Some(store) = self.store.clone() {
@@ -743,13 +965,6 @@ impl Studio {
         }
         cx.notify();
     }
-    fn session_busy(&self) -> bool {
-        self.library
-            .active()
-            .drawings
-            .iter()
-            .any(|d| self.running.contains_key(&d.id))
-    }
 }
 
 impl Studio {
@@ -757,7 +972,7 @@ impl Studio {
         div()
             .flex()
             .flex_col()
-            .w(px(248.))
+            .w(px(212.))
             .h_full()
             .flex_shrink_0()
             .bg(rgb(0x14171d))
@@ -793,14 +1008,14 @@ impl Studio {
                                     .text_lg()
                                     .child("AIDRAW"),
                             )
-                            .child(hint("三只猫专用图像工作室")),
+                            .child(hint("图像批量创作空间")),
                     ),
             )
             .child(
                 Button::new("new-session")
                     .primary()
                     .icon(IconName::Plus)
-                    .label("新建会话")
+                    .label("新建项目")
                     .w_full()
                     .on_click(cx.listener(|this, _, w, cx| this.new_session(w, cx))),
             )
@@ -808,7 +1023,7 @@ impl Studio {
                 div()
                     .flex()
                     .justify_between()
-                    .child(hint("创作会话"))
+                    .child(hint("我的项目"))
                     .child(hint(format!("{}", self.library.sessions.len()))),
             )
             .child(
@@ -860,7 +1075,15 @@ impl Studio {
                                     )
                                     .when(busy, |el| el.child(Spinner::new().small())),
                             )
-                            .child(hint(format!("{} 幅绘画", session.drawings.len())))
+                            .child(hint(format!(
+                                "{} 个任务 · {} 已完成",
+                                session.drawings.len(),
+                                session
+                                    .drawings
+                                    .iter()
+                                    .filter(|d| d.status == Status::Completed)
+                                    .count()
+                            )))
                     })),
             )
             .child(
@@ -904,7 +1127,7 @@ impl Studio {
                                 "RightAPI · 已配置密钥"
                             })),
                     )
-                    .child(hint("Ctrl+N 新会话 · Ctrl+Enter 生成")),
+                    .child(hint("Ctrl+N 新项目")),
             )
     }
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -988,7 +1211,7 @@ impl Studio {
                         )
                     }),
             )
-            .child(hint(format!("{} 幅绘画", active.drawings.len())))
+            .child(hint(format!("{} 个任务", active.drawings.len())))
             .child(
                 Button::new("delete-session")
                     .ghost()
@@ -1019,20 +1242,6 @@ impl Studio {
                 .child(Button::new("api-docs").ghost().icon(IconName::ExternalLink).label("查看 RightAPI 接口文档").on_click(|_, _, cx| cx.open_url("https://docs.rightapi.ai/docs/rc_draw/openai.html"))))
     }
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let examples = [
-            (
-                "商业摄影",
-                "一瓶透明香水，放在湿润的黑色岩石上，商业棚拍风格，柔和侧光，浅景深。顶部居中写有优雅的英文标题 AURORA。",
-            ),
-            (
-                "插画灵感",
-                "一座漂浮在云海之上的微型花园，柔和晨光，精致的植物与玻璃温室，等距视角，温暖的手绘插画。",
-            ),
-            (
-                "产品设计",
-                "极简无线耳机的产品概念图，哑光奶油白材质，柔和阴影，干净的浅灰背景，工业设计摄影。",
-            ),
-        ];
         div()
             .flex()
             .flex_col()
@@ -1041,67 +1250,74 @@ impl Studio {
             .items_center()
             .justify_center()
             .gap_5()
-            .p_8()
+            .p_6()
             .child(
                 div()
-                    .flex()
-                    .size_16()
-                    .rounded_2xl()
-                    .bg(rgb(0x23463f))
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(0x9de4cb))
-                    .child(Icon::new(IconName::Sparkles).size_8()),
+                    .px_3()
+                    .py_1()
+                    .rounded_full()
+                    .bg(rgb(0x233b34))
+                    .text_xs()
+                    .text_color(rgb(0xa7e2c5))
+                    .child("BATCH STUDIO / 批量图像工作台"),
             )
             .child(
                 div()
                     .text_3xl()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("让想象，成为画面。"),
+                    .child("一条指令，处理整组图片。"),
             )
             .child(
                 div()
                     .text_color(rgb(0xa4aebc))
-                    .child("写下灵感，或上传一张图片开始新的创作。"),
+                    .child("换背景、调色、修图、风格转换……由你定义。"),
             )
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_3()
-                    .mt_4()
-                    .children(
-                        examples
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, (label, prompt))| {
-                                Button::new(("example", index))
-                                    .outline()
-                                    .icon(IconName::ArrowUpRight)
-                                    .label(label)
-                                    .on_click(cx.listener(move |this, _, w, cx| {
-                                        this.mode = Mode::Generate;
-                                        this.prompt.update(cx, |s, cx| {
-                                            s.set_value(prompt, w, cx);
-                                            s.focus(w, cx);
-                                        });
-                                        cx.notify();
-                                    }))
-                            }),
+                    .flex_col()
+                    .gap_4()
+                    .w_full()
+                    .max_w(px(490.))
+                    .p_6()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(0x343d46))
+                    .bg(rgb(0x1d242b))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(hint("01"))
+                            .child("添加图片 · 一次多选，自由增减"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(hint("02"))
+                            .child("写下指令 · 对每张图应用相同修改"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(hint("03"))
+                            .child("自动处理 · 逐张保存，一次导出"),
+                    )
+                    .child(
+                        Button::new("empty-add")
+                            .primary()
+                            .icon(IconName::Plus)
+                            .label("添加图片，开始处理")
+                            .loading(self.importing)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_references(cx))),
                     ),
             )
-            .when(self.api_key.is_empty(), |el| {
-                el.child(
-                    Button::new("setup-first")
-                        .ghost()
-                        .label("先配置 API Key →")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.settings_open = true;
-                            cx.notify();
-                        })),
-                )
-            })
+            .child(hint("不限固定张数 · 每张独立输出 · 本地自动保存"))
     }
 }
 
@@ -1110,51 +1326,57 @@ impl Studio {
         let id = drawing.id;
         let reuse = drawing.clone();
         let busy = self.running.contains_key(&id);
-        let resume = !busy && drawing.task_id.is_some() && drawing.status != Status::Completed;
-        let status_color = match drawing.status {
-            Status::Completed => rgb(0x93d9b7),
+        let resumable = !busy && drawing.can_resume();
+        let pending = drawing.status.active() || drawing.status == Status::Waiting;
+        let color = match drawing.status {
+            Status::Completed => rgb(0xa0dfbf),
             Status::Failed => rgb(0xf4a6a6),
             _ => rgb(0xb3c5df),
         };
+        let preview = drawing
+            .images
+            .first()
+            .map(|i| i.path.clone())
+            .or_else(|| drawing.references.first().cloned());
+        let open = preview.clone();
         div()
             .flex()
             .flex_col()
-            .w_full()
+            .w(px(270.))
+            .min_w(px(250.))
+            .max_w(px(420.))
+            .flex_1()
             .flex_shrink_0()
-            .gap_4()
-            .p_5()
+            .gap_3()
+            .p_3()
             .rounded_xl()
-            .bg(rgb(0x20242c))
+            .bg(rgb(0x202730))
             .border_1()
-            .border_color(rgb(0x333b46))
+            .border_color(rgb(0x343e49))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
-                            .text_xs()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(0x2c343e))
-                            .child(drawing.mode.label()),
-                    )
-                    .child(hint(drawing.settings.model.clone()))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(status_color)
-                            .child(drawing.status.label()),
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(
+                                drawing
+                                    .source_name
+                                    .clone()
+                                    .unwrap_or_else(|| drawing.mode.label().into()),
+                            ),
                     )
                     .child(
                         Button::new(SharedString::from(format!("delete-{id}")))
                             .ghost()
                             .small()
                             .icon(IconName::Trash)
-                            .tooltip("删除这幅绘画")
+                            .tooltip("删除此任务")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.deleting = Some(DeleteTarget::Drawing(id));
                                 cx.notify();
@@ -1163,146 +1385,83 @@ impl Studio {
             )
             .child(
                 div()
-                    .text_sm()
-                    .line_height(rems(1.5))
-                    .child(drawing.prompt.clone()),
-            )
-            .when(!drawing.references.is_empty(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .child(hint("参考图"))
-                        .children(drawing.references.iter().map(|path| {
-                            img(path.clone())
-                                .size_12()
+                    .id(SharedString::from(format!("preview-{id}")))
+                    .relative()
+                    .w_full()
+                    .h(px(220.))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .bg(rgb(0x333c46))
+                    .child(
+                        img(crate::branding::transparency_grid())
+                            .absolute()
+                            .size_full()
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .when_some(preview, |el, path| {
+                        el.child(
+                            img(path)
+                                .relative()
+                                .size_full()
                                 .object_fit(ObjectFit::Contain)
-                                .rounded_md()
-                        })),
-                )
-            })
-            .when(drawing.status.active(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .p_6()
-                        .rounded_lg()
-                        .bg(rgb(0x181c23))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(Spinner::new().small())
-                                .child(format!(
-                                    "{} · {}%",
-                                    drawing.status.label(),
-                                    drawing.progress
-                                ))
-                                .child(div().flex_1())
-                                .child(
-                                    Button::new(SharedString::from(format!("pause-{id}")))
-                                        .ghost()
-                                        .small()
-                                        .label("暂停查询")
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| this.pause(id, cx)),
-                                        ),
-                                ),
+                                .with_fallback(|| hint("图片暂不可用").into_any_element()),
                         )
-                        .child(
-                            Progress::new(SharedString::from(format!("progress-{id}")))
-                                .value(drawing.progress as f32)
-                                .loading(drawing.progress == 0),
-                        )
-                        .child(hint("结果会自动保存，你可以切换会话继续创作。")),
-                )
-            })
-            .children(drawing.images.iter().map(|image| {
-                let edit = image.clone();
-                let export = image.clone();
-                let open = image.path.clone();
+                    })
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        if let Some(path) = &open {
+                            cx.open_with_system(path);
+                        }
+                    }),
+            )
+            .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_3()
+                    .items_center()
+                    .gap_2()
+                    .when(busy, |el| el.child(Spinner::new().small()))
                     .child(
                         div()
-                            .id(SharedString::from(format!("image-{}", image.id)))
-                            .flex()
-                            .items_start()
-                            .w(px(300.))
-                            .h(px(300.))
-                            .flex_shrink_0()
-                            .rounded_lg()
-                            .bg(rgb(0x13161c))
-                            .overflow_hidden()
-                            .cursor_pointer()
-                            .on_click(move |_, _, cx| cx.open_with_system(&open))
-                            .child(
-                                img(image.path.clone())
-                                    .size_full()
-                                    .object_fit(ObjectFit::Cover)
-                                    .with_fallback(|| {
-                                        hint("图片文件不存在或无法读取").into_any_element()
-                                    }),
-                            ),
+                            .text_xs()
+                            .text_color(color)
+                            .child(drawing.status.label()),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .gap_2()
-                            .child(hint("300 × 300 预览 · 点击查看原图"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "edit-{}",
-                                            image.id
-                                        )))
-                                        .outline()
-                                        .small()
-                                        .icon(IconName::Pencil)
-                                        .label("编辑此图")
-                                        .on_click(
-                                            cx.listener(move |this, _, w, cx| {
-                                                this.edit_image(edit.clone(), w, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "export-{}",
-                                            image.id
-                                        )))
-                                        .outline()
-                                        .small()
-                                        .icon(IconName::Download)
-                                        .label("另存为")
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.export_image(export.clone(), cx)
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    )
-            }))
+                    .child(div().flex_1())
+                    .child(hint(drawing.settings.format.to_uppercase())),
+            )
+            .when(pending, |el| {
+                el.child(
+                    Progress::new(SharedString::from(format!("progress-{id}")))
+                        .value(drawing.progress as f32)
+                        .loading(drawing.status.active() && drawing.progress == 0),
+                )
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xaeb9c7))
+                    .line_height(rems(1.2))
+                    .child(drawing.prompt.clone()),
+            )
+            .when(drawing.batch_id.is_some(), |el| {
+                el.child(hint("独立处理 · 1 张原图 → 1 份结果"))
+            })
+            .when(
+                drawing.mode == Mode::Edit && drawing.references.len() > 1,
+                |el| {
+                    el.child(hint(format!(
+                        "{} 张参考图 · 融合编辑",
+                        drawing.references.len()
+                    )))
+                },
+            )
             .when_some(drawing.error.clone(), |el, error| {
                 el.child(
                     div()
-                        .p_3()
+                        .p_2()
                         .rounded_md()
                         .bg(rgb(0x382a2b))
-                        .text_sm()
+                        .text_xs()
                         .text_color(rgb(0xf1b7b7))
                         .child(error),
                 )
@@ -1312,75 +1471,237 @@ impl Studio {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap_3()
-                    .child(hint(format!(
-                        "{} · {} · {}",
-                        drawing.settings.size,
-                        drawing.settings.quality,
-                        drawing.settings.format.to_uppercase()
-                    )))
-                    .child(div().flex_1())
-                    .when(resume, |el| {
+                    .gap_2()
+                    .when(pending, |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("pause-{id}")))
+                                .ghost()
+                                .small()
+                                .label(if drawing.status == Status::Waiting {
+                                    "暂停此项"
+                                } else {
+                                    "暂停查询"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| this.pause(id, cx))),
+                        )
+                    })
+                    .when(resumable, |el| {
                         el.child(
                             Button::new(SharedString::from(format!("resume-{id}")))
                                 .outline()
                                 .small()
                                 .icon(IconName::RefreshCw)
-                                .label("继续查询")
+                                .label(if drawing.status == Status::Paused {
+                                    "继续处理"
+                                } else {
+                                    "继续查询"
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| this.resume(id, cx))),
                         )
                     })
+                    .children(drawing.images.iter().map(|image| {
+                        let edit = image.clone();
+                        let export = image.clone();
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new(SharedString::from(format!("edit-{}", image.id)))
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::Pencil)
+                                    .label("编辑")
+                                    .on_click(cx.listener(move |this, _, w, cx| {
+                                        this.edit_image(edit.clone(), w, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("export-{}", image.id)))
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::Download)
+                                    .label("保存")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.export_image(export.clone(), cx)
+                                    })),
+                            )
+                    }))
                     .child(
                         Button::new(SharedString::from(format!("reuse-{id}")))
                             .ghost()
                             .small()
-                            .label("复用提示词")
+                            .label("复用指令")
                             .on_click(
                                 cx.listener(move |this, _, w, cx| this.reuse(reuse.clone(), w, cx)),
                             ),
                     ),
             )
     }
+
+    fn render_queue(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let drawings = &self.library.active().drawings;
+        let done = drawings
+            .iter()
+            .filter(|d| d.status == Status::Completed)
+            .count();
+        let waiting = drawings
+            .iter()
+            .filter(|d| d.status == Status::Waiting)
+            .count();
+        let active = drawings.iter().filter(|d| d.status.active()).count();
+        let paused = drawings.iter().any(|d| d.can_resume());
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap_3()
+            .px_5()
+            .py_4()
+            .border_b_1()
+            .border_color(rgb(0x303944))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_3()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("处理队列"))
+                            .child(hint(format!(
+                                "已完成 {done}/{} · 进行中 {active} · 等待 {waiting}",
+                                drawings.len()
+                            ))),
+                    )
+                    .child(
+                        Button::new("pause-queue")
+                            .ghost()
+                            .small()
+                            .label("暂停后续")
+                            .disabled(waiting == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.pause_queue(cx))),
+                    )
+                    .child(
+                        Button::new("continue-queue")
+                            .outline()
+                            .small()
+                            .label("继续队列")
+                            .disabled(!paused)
+                            .on_click(cx.listener(|this, _, _, cx| this.continue_queue(cx))),
+                    )
+                    .child(
+                        Button::new("export-all")
+                            .primary()
+                            .small()
+                            .icon(IconName::Download)
+                            .label("导出已完成")
+                            .disabled(done == 0)
+                            .loading(self.exporting)
+                            .on_click(cx.listener(|this, _, _, cx| this.export_all(cx))),
+                    ),
+            )
+            .child(
+                div().flex().flex_wrap().gap_2().children(
+                    [
+                        (ResultFilter::All, "全部"),
+                        (ResultFilter::Pending, "待完成"),
+                        (ResultFilter::Completed, "已完成"),
+                        (ResultFilter::Attention, "需关注"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (filter, label))| {
+                        let count = drawings.iter().filter(|d| filter.matches(d)).count();
+                        Button::new(("filter", index))
+                            .ghost()
+                            .small()
+                            .selected(self.filter == filter)
+                            .label(format!("{label} {count}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.filter = filter;
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            )
+    }
+
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.session_busy();
-        div().flex().flex_col().flex_shrink_0().gap_3().p_5().border_t_1().border_color(rgb(0x2a303a)).bg(rgb(0x1b1f26))
-            .child(div().flex().items_center().gap_2()
-                .child(Button::new("mode-generate").ghost().small().icon(IconName::Sparkles).label("文生图").selected(self.mode == Mode::Generate)
-                    .on_click(cx.listener(|this, _, _, cx| { this.mode = Mode::Generate; cx.notify(); })))
-                .child(Button::new("mode-edit").ghost().small().icon(IconName::Image).label("图片编辑").selected(self.mode == Mode::Edit)
-                    .on_click(cx.listener(|this, _, _, cx| { this.mode = Mode::Edit; cx.notify(); })))
-                .child(div().flex_1())
-                .child(Button::new("add-reference").ghost().small().icon(IconName::Paperclip).label("添加参考图").loading(self.importing)
-                    .on_click(cx.listener(|this, _, _, cx| this.add_references(cx)))))
-            .when(self.mode == Mode::Edit, |el| el.child(div().flex().flex_wrap().items_center().gap_2()
-                .when(self.references.is_empty(), |el| el.child(hint("添加图片后写下修改指令。支持多图融合；局部修改请直接在提示词中描述。")))
-                .children(self.references.iter().enumerate().map(|(index, path)| {
-                    div().flex().items_center().gap_1().p_1().rounded_md().bg(rgb(0x2c343e))
-                        .child(img(path.clone()).size_10().object_fit(ObjectFit::Contain).rounded_md()).child(hint(format!("图 {}", index + 1)))
-                        .child(Button::new(("remove-reference", index)).ghost().small().icon(IconName::X).tooltip("移除参考图")
-                            .on_click(cx.listener(move |this, _, _, cx| { if index < this.references.len() { this.references.remove(index); } cx.notify(); })))
-                }))))
-            .child(Textarea::new(&self.prompt).h(px(94.)).w_full())
-            .child(div().flex().items_end().gap_3()
-                .child(div().flex().flex_col().gap_1().w(px(222.)).child(hint("模型")).child(Select::new(&self.model).w_full()))
-                .child(div().flex().flex_col().gap_1().w(px(120.)).child(hint("画面尺寸")).child(Select::new(&self.size).w_full()))
-                .child(div().flex().flex_col().gap_1().w(px(95.)).child(hint("质量")).child(Select::new(&self.quality).w_full()))
-                .child(div().flex().flex_col().gap_1().w(px(90.)).child(hint("格式")).child(Select::new(&self.format).w_full()))
-                .child(div().flex_1())
-                .child(Button::new("generate").primary().icon(IconName::ArrowUp).label(if busy { "正在创作" } else if self.mode == Mode::Edit { "开始编辑" } else { "生成图片" })
-                    .disabled(busy || self.importing || self.storage_error.is_some()).on_click(cx.listener(|this, _, w, cx| this.submit(w, cx)))))
-            .when(self.custom_size, |el| el.child(div().flex().flex_col().gap_2()
-                .child(div().flex().flex_wrap().items_center().gap_2()
-                    .child(hint("宽度"))
-                    .child(Input::new(&self.custom_width).w(px(100.)))
-                    .child(hint("× 高度"))
-                    .child(Input::new(&self.custom_height).w(px(100.)))
-                    .child(hint("像素 · 每边为 16 的倍数，最大 3840")))
-                .child(match model::validate_size(&self.library.settings.size) {
-                    Ok(()) => hint("宽高比不超过 3:1，总像素为 655360–8294400").into_any_element(),
-                    Err(error) => div().text_xs().text_color(rgb(0xf4a6a6)).child(error.to_string()).into_any_element(),
-                })))
-            .child(hint("每次生成 1 张 · Ctrl+Enter 发送 · 高质量与大尺寸可能需要更长时间"))
+        let count = self.references.len();
+        let label = match self.mode {
+            Mode::Generate => "生成图片".to_string(),
+            Mode::Edit => "开始融合编辑".to_string(),
+            Mode::Batch => {
+                if count == 0 {
+                    "开始批量处理".into()
+                } else {
+                    format!("处理这 {count} 张图片")
+                }
+            }
+        };
+        div().flex().flex_col().w(px(340.)).flex_shrink_0().h_full().border_l_1().border_color(rgb(0x303944)).bg(rgb(0x1d242b))
+            .child(div().id("composer-scroll").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().p_5().gap_5()
+                .child(div().flex().flex_col().gap_1().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("定义你的处理方式"))
+                    .child(hint("一组图片，一个目标。")))
+                .child(div().flex().flex_wrap().gap_1().p_1().rounded_lg().bg(rgb(0x141b22)).children([
+                    (Mode::Batch, "批量处理"), (Mode::Edit, "融合编辑"), (Mode::Generate, "文生图"),
+                ].into_iter().enumerate().map(|(index, (mode, label))|
+                    Button::new(("mode", index)).ghost().small().label(label).selected(self.mode == mode)
+                        .on_click(cx.listener(move |this, _, w, cx| this.set_mode(mode, w, cx))))))
+                .child(hint(match self.mode {
+                    Mode::Batch => "每张图片独立应用同一指令，分别输出结果。",
+                    Mode::Edit => "将多张图片作为参考，一起生成一份结果。",
+                    Mode::Generate => "用文字描述画面，生成一张新图片。",
+                }))
+                .when(self.mode != Mode::Generate, |el| el.child(div().flex().flex_col().gap_3()
+                    .child(div().flex().items_center().justify_between().child("01 / 原始图片")
+                        .child(Button::new("clear-references").ghost().small().label("清空").disabled(count == 0 || self.importing)
+                            .on_click(cx.listener(|this, _, _, cx| { this.references.clear(); this.persist(); cx.notify(); }))))
+                    .child(Button::new("add-reference").outline().icon(IconName::Plus).label(if count == 0 { "添加图片 · 支持多选" } else { "继续添加图片" }).w_full().loading(self.importing)
+                        .on_click(cx.listener(|this, _, _, cx| this.add_references(cx))))
+                    .when(count > 0, |el| el.child(div().id("reference-list").flex().flex_col().max_h(px(180.)).overflow_y_scroll().gap_2()
+                        .children(self.references.iter().enumerate().map(|(index, path)|
+                            div().flex().items_center().gap_2().p_1().rounded_md().bg(rgb(0x27313b))
+                                .child(img(path.clone()).size_8().object_fit(ObjectFit::Contain).rounded_md())
+                                .child(div().flex_1().min_w_0().text_xs().truncate().child(model::reference_name(path)))
+                                .child(Button::new(("remove-reference", index)).ghost().small().icon(IconName::X)
+                                    .on_click(cx.listener(move |this, _, _, cx| { if index < this.references.len() { this.references.remove(index); this.persist(); } cx.notify(); })))))))
+                    .child(hint(format!("已选择 {count} 张 · PNG / JPEG / WebP · 单张 ≤ 50 MB")))))
+                .child(div().flex().flex_col().gap_3().child(if self.mode == Mode::Generate { "创作提示词" } else { "02 / 统一处理指令" })
+                    .child(Textarea::new(&self.prompt).h(px(124.)).w_full())
+                    .when(self.mode == Mode::Batch, |el| el.child(div().flex().flex_col().gap_2()
+                        .child(hint("快捷起点 · 点击后可自由修改"))
+                        .child(div().flex().flex_wrap().gap_2().children([
+                            ("更换背景", "将背景替换为干净的浅灰色摄影棚背景，保留原图主体、构图和细节，光线与阴影自然协调。", false),
+                            ("抠图透明底", CUTOUT_PROMPT, true),
+                            ("统一色调", "将画面调整为统一的温暖自然色调，保留主体原貌和细节，平衡曝光、对比度与饱和度。", false),
+                            ("优化画质", "提升画面清晰度，减少噪点，修复模糊细节，保持主体、构图与原始风格，不添加新元素。", false),
+                        ].into_iter().enumerate().map(|(index, (label, prompt, transparent))|
+                            Button::new(("preset", index)).outline().small().label(label)
+                                .on_click(cx.listener(move |this, _, w, cx| this.preset(prompt, transparent, w, cx)))))))))
+                .child(div().flex().flex_col().gap_3().pt_4().border_t_1().border_color(rgb(0x303944)).child("输出设置")
+                    .child(div().flex().flex_col().gap_1().child(hint("模型")).child(Select::new(&self.model).w_full()))
+                    .child(div().flex().gap_3()
+                        .child(div().flex_1().min_w_0().flex().flex_col().gap_1().child(hint("画面尺寸")).child(Select::new(&self.size).w_full()))
+                        .child(div().flex_1().min_w_0().flex().flex_col().gap_1().child(hint("质量")).child(Select::new(&self.quality).w_full()))))
+                .when(self.custom_size, |el| el.child(div().flex().flex_col().gap_2()
+                    .child(div().flex().items_center().gap_2().child(Input::new(&self.custom_width).w(px(120.))).child(hint("×")).child(Input::new(&self.custom_height).w(px(120.))))
+                    .child(match model::validate_size(&self.library.settings.size) {
+                        Ok(()) => hint("每边为 16 的倍数，最大 3840 像素").into_any_element(),
+                        Err(error) => div().text_xs().text_color(rgb(0xf4a6a6)).child(error.to_string()).into_any_element(),
+                    })))
+                .child(div().flex().items_center().gap_3().child(hint("文件格式")).child(Select::new(&self.format).w(px(180.))))
+                .child(hint("需要透明背景时，请在指令中说明并选择 PNG 或 WebP。")))
+            .child(div().flex().flex_col().flex_shrink_0().p_5().gap_2().border_t_1().border_color(rgb(0x303944))
+                .child(Button::new("generate").primary().icon(IconName::ArrowUp).label(label).w_full()
+                    .disabled(self.importing || self.storage_error.is_some() || (self.mode != Mode::Generate && count == 0))
+                    .on_click(cx.listener(|this, _, w, cx| this.submit(w, cx))))
+                .child(hint("Ctrl+Enter 提交 · 最多同时处理 3 张 · 自动保存")))
     }
     fn render_delete(&self, target: DeleteTarget, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1394,8 +1715,8 @@ impl Studio {
             .border_color(rgb(0x684343))
             .bg(rgb(0x382a2b))
             .child(div().font_weight(FontWeight::SEMIBOLD).child(match target {
-                DeleteTarget::Session(_) => "删除整个会话？",
-                DeleteTarget::Drawing(_) => "删除这幅绘画？",
+                DeleteTarget::Session(_) => "删除整个项目？",
+                DeleteTarget::Drawing(_) => "删除此任务及其结果？",
             }))
             .child(
                 div()
@@ -1427,13 +1748,12 @@ impl Studio {
 
 impl Render for Studio {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let background = cx.theme().background;
         div()
             .id("studio")
             .key_context("AIDRAW")
             .flex()
             .size_full()
-            .bg(background)
+            .bg(rgb(0x171e25))
             .text_color(rgb(0xe7ecf3))
             .font_family(crate::branding::FONT_FAMILY)
             .text_sm()
@@ -1472,7 +1792,7 @@ impl Render for Studio {
                                 .px_5()
                                 .py_2()
                                 .bg(if error { rgb(0x382a2b) } else { rgb(0x233e36) })
-                                .child(div().flex_1().text_sm().child(message))
+                                .child(div().flex_1().min_w_0().text_sm().child(message))
                                 .child(
                                     Button::new("dismiss-notice")
                                         .ghost()
@@ -1490,29 +1810,73 @@ impl Render for Studio {
                     })
                     .when(self.settings_open, |el| el.child(self.render_settings(cx)))
                     .when(!self.settings_open, |el| {
-                        el.when(self.library.active().drawings.is_empty(), |el| {
-                            el.child(self.render_empty(cx))
-                        })
-                        .when(!self.library.active().drawings.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .id("drawings")
-                                    .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .p_6()
-                                    .gap_5()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&self.scroll)
-                                    .children(self.library.active().drawings.iter().rev().map(
-                                        |drawing| {
-                                            self.render_drawing(drawing, cx).into_any_element()
-                                        },
-                                    )),
-                            )
-                        })
-                        .child(self.render_composer(cx))
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .when(self.library.active().drawings.is_empty(), |el| {
+                                            el.child(self.render_empty(cx))
+                                        })
+                                        .when(!self.library.active().drawings.is_empty(), |el| {
+                                            el.child(self.render_queue(cx)).child(
+                                                div()
+                                                    .id("drawings")
+                                                    .flex_1()
+                                                    .min_h_0()
+                                                    .overflow_y_scroll()
+                                                    .track_scroll(&self.scroll)
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_wrap()
+                                                            .items_start()
+                                                            .gap_4()
+                                                            .p_5()
+                                                            .children(
+                                                                self.library
+                                                                    .active()
+                                                                    .drawings
+                                                                    .iter()
+                                                                    .filter(|d| {
+                                                                        self.filter.matches(d)
+                                                                    })
+                                                                    .map(|drawing| {
+                                                                        self.render_drawing(
+                                                                            drawing, cx,
+                                                                        )
+                                                                        .into_any_element()
+                                                                    }),
+                                                            ),
+                                                    )
+                                                    .when(
+                                                        !self
+                                                            .library
+                                                            .active()
+                                                            .drawings
+                                                            .iter()
+                                                            .any(|d| self.filter.matches(d)),
+                                                        |el| {
+                                                            el.child(
+                                                                div().p_8().child(hint(
+                                                                    "当前状态下暂无任务",
+                                                                )),
+                                                            )
+                                                        },
+                                                    ),
+                                            )
+                                        }),
+                                )
+                                .child(self.render_composer(cx)),
+                        )
                     }),
             )
     }
