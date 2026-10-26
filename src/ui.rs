@@ -204,7 +204,8 @@ impl Studio {
                         .selected_value()
                         .map(|v| v.to_string())
                         .unwrap_or_default();
-                    if value.as_ref() != "gpt-image-2.5" && matches!(old.as_str(), "xhigh" | "max")
+                    if !model::supports_extended_quality(value.as_ref())
+                        && matches!(old.as_str(), "xhigh" | "max")
                     {
                         this.quality.update(cx, |s, cx| {
                             s.set_selected_value(&SharedString::from("high"), window, cx)
@@ -522,7 +523,7 @@ impl Studio {
             self.message(true, "先添加图片，再填写希望应用的处理指令", cx);
             return;
         }
-        if let Err(e) = self.library.settings.validate() {
+        if let Err(e) = self.library.settings.validate_for(self.mode) {
             self.message(true, e.to_string(), cx);
             return;
         }
@@ -1686,6 +1687,12 @@ impl Studio {
                                 .on_click(cx.listener(move |this, _, w, cx| this.preset(prompt, transparent, w, cx)))))))))
                 .child(div().flex().flex_col().gap_3().pt_4().border_t_1().border_color(rgb(0x303944)).child("输出设置")
                     .child(div().flex().flex_col().gap_1().child(hint("模型")).child(Select::new(&self.model).w_full()))
+                    .when(self.mode != Mode::Generate, |el| el.child(hint(
+                        if model::EDIT_MODELS.contains(&self.library.settings.model.as_str()) {
+                            "编辑支持 gpt-image-2、2.5-flare 和 2.5-sunburst。"
+                        } else {
+                            "当前为文生图兼容型号，请选择 gpt-image-2、2.5-flare 或 2.5-sunburst 进行编辑。"
+                        })))
                     .child(div().flex().gap_3()
                         .child(div().flex_1().min_w_0().flex().flex_col().gap_1().child(hint("画面尺寸")).child(Select::new(&self.size).w_full()))
                         .child(div().flex_1().min_w_0().flex().flex_col().gap_1().child(hint("质量")).child(Select::new(&self.quality).w_full()))))
@@ -1696,7 +1703,7 @@ impl Studio {
                         Err(error) => div().text_xs().text_color(rgb(0xf4a6a6)).child(error.to_string()).into_any_element(),
                     })))
                 .child(div().flex().items_center().gap_3().child(hint("文件格式")).child(Select::new(&self.format).w(px(180.))))
-                .child(hint("需要透明背景时，请在指令中说明并选择 PNG 或 WebP。")))
+                .child(hint("接口文档暂不支持透明背景；选择 PNG 或 WebP 不代表能输出透明底。")))
             .child(div().flex().flex_col().flex_shrink_0().p_5().gap_2().border_t_1().border_color(rgb(0x303944))
                 .child(Button::new("generate").primary().icon(IconName::ArrowUp).label(label).w_full()
                     .disabled(self.importing || self.storage_error.is_some() || (self.mode != Mode::Generate && count == 0))

@@ -8,7 +8,26 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const MODELS: &[&str] = &["gpt-image-2", "gpt-image-2-vip", "gpt-image-2.5"];
+pub const EDIT_MODELS: &[&str] = &[
+    "gpt-image-2",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+];
+// Keep working generation aliases available without silently changing their model or cost.
+pub const MODELS: &[&str] = &[
+    "gpt-image-2",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2-vip",
+    "gpt-image-2.5",
+];
+
+pub fn supports_extended_quality(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-image-2.5" | "gpt-image-2.5-flare" | "gpt-image-2.5-sunburst"
+    )
+}
 pub const QUALITIES: &[&str] = &["auto", "low", "medium", "high", "xhigh", "max"];
 pub const SIZES: &[&str] = &[
     "auto",
@@ -63,7 +82,9 @@ impl Settings {
             }
             .into();
         }
-        if self.model != "gpt-image-2.5" && matches!(self.quality.as_str(), "xhigh" | "max") {
+        if !supports_extended_quality(&self.model)
+            && matches!(self.quality.as_str(), "xhigh" | "max")
+        {
             self.quality = "high".into();
         }
     }
@@ -85,8 +106,10 @@ impl Settings {
         if !QUALITIES.contains(&self.quality.as_str()) {
             bail!("请选择支持的质量档位");
         }
-        if self.model != "gpt-image-2.5" && matches!(self.quality.as_str(), "xhigh" | "max") {
-            bail!("当前模型最高支持 high，请选择 gpt-image-2.5 或降低质量");
+        if !supports_extended_quality(&self.model)
+            && matches!(self.quality.as_str(), "xhigh" | "max")
+        {
+            bail!("当前模型最高支持 high，请选择 GPT Image 2.5 系列或降低质量");
         }
         validate_size(&self.size)?;
         if !FORMATS.contains(&self.format.as_str()) {
@@ -101,6 +124,17 @@ impl Settings {
             self.base_url.trim_end_matches('/'),
             suffix.trim_start_matches('/')
         )
+    }
+
+    pub fn validate_for(&self, mode: Mode) -> Result<()> {
+        self.validate()?;
+        if mode != Mode::Generate && !EDIT_MODELS.contains(&self.model.as_str()) {
+            bail!(
+                "{} 未列入接口文档的图片编辑模型。请在右侧模型中选择 gpt-image-2、gpt-image-2.5-flare 或 gpt-image-2.5-sunburst 后再提交；原有文生图模型保持可用。",
+                self.model
+            );
+        }
+        Ok(())
     }
 }
 
@@ -288,7 +322,7 @@ impl Library {
         if prompt.trim().is_empty() {
             bail!("请先填写处理指令");
         }
-        self.settings.validate()?;
+        self.settings.validate_for(mode)?;
         if mode != Mode::Generate && references.is_empty() {
             bail!("请先添加需要处理的图片");
         }
@@ -688,24 +722,35 @@ mod tests {
     }
 
     #[test]
-    fn migrates_retired_model_choices_and_accepts_requested_models() {
+    fn preserves_documented_models_and_validates_edit_compatibility() {
         let mut settings = Settings {
             model: "gpt-image-2.5-flare".into(),
             quality: "max".into(),
             ..Settings::default()
         };
         settings.normalize_model();
-        assert_eq!(settings.model, "gpt-image-2.5");
+        assert_eq!(settings.model, "gpt-image-2.5-flare");
         settings.validate().unwrap();
         for model in MODELS {
             settings.model = (*model).into();
             settings.quality = "auto".into();
             settings.validate().unwrap();
+            settings.normalize_model();
+            assert_eq!(settings.model, *model);
+            settings.validate_for(Mode::Generate).unwrap();
+            for mode in [Mode::Edit, Mode::Batch] {
+                assert_eq!(
+                    settings.validate_for(mode).is_ok(),
+                    EDIT_MODELS.contains(model)
+                );
+            }
         }
         settings.model = "gpt-image-2.5-sunburst".into();
-        assert!(settings.validate().is_err());
+        settings.quality = "max".into();
+        settings.validate_for(Mode::Edit).unwrap();
         settings.normalize_model();
-        assert_eq!(settings.model, "gpt-image-2.5");
+        assert_eq!(settings.model, "gpt-image-2.5-sunburst");
+        assert_eq!(settings.quality, "max");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::model::{ImageAsset, Mode, Settings, Status, atomic_write};
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::{Client, Response, multipart};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
 use std::{
     io::{Cursor, Read},
@@ -150,11 +151,13 @@ impl Api {
                     {
                         failures += 1;
                         if failures >= 5 {
-                            bail!("任务查询服务暂不可用。请稍后点击「继续查询」。");
+                            return response_json(response)
+                                .context("任务查询服务暂不可用，请稍后继续查询")
+                                .map(|_| ());
                         }
                     }
                     Ok(response) => {
-                        value = response_json(response)?;
+                        value = response_json(response).context("查询任务失败")?;
                         failures = 0;
                         break;
                     }
@@ -177,6 +180,7 @@ impl Api {
 
     fn submit(&self, job: &Job, key: &str) -> Result<Value> {
         let settings = &job.settings;
+        settings.validate_for(job.mode)?;
         let response = match job.mode {
             Mode::Generate => self.client.post(settings.endpoint("images/generations")).bearer_auth(key)
                 .json(&json!({"model": settings.model, "prompt": job.prompt, "async": true,
@@ -187,24 +191,34 @@ impl Api {
                     bail!("批量任务必须且只能包含一张原图");
                 }
                 if job.references.is_empty() { bail!("图片编辑至少需要一张参考图"); }
-                let mut form = multipart::Form::new().text("model", settings.model.clone())
-                    .text("prompt", job.prompt.clone()).text("async", "true").text("n", "1")
-                    .text("size", settings.size.clone()).text("quality", settings.quality.clone())
-                    .text("output_format", settings.format.clone());
+                let mut images = Vec::with_capacity(job.references.len());
                 for path in &job.references {
-                    let mime = match path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
-                        "png" => "image/png", "jpg" | "jpeg" => "image/jpeg", "webp" => "image/webp",
-                        _ => bail!("参考图片格式不支持"),
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path).context("参考图已丢失，请重新选择")?
+                        .take(50 * 1024 * 1024 + 1).read_to_end(&mut bytes)
+                        .context("无法读取参考图片")?;
+                    if bytes.len() > 50 * 1024 * 1024 { bail!("单张参考图请控制在 50 MB 内"); }
+                    let mime = match image::guess_format(&bytes).context("无法识别参考图片内容")? {
+                        image::ImageFormat::Png => "image/png",
+                        image::ImageFormat::Jpeg => "image/jpeg",
+                        image::ImageFormat::WebP => "image/webp",
+                        _ => bail!("参考图片仅支持 PNG、JPEG 或 WebP"),
                     };
-                    // The documented API repeats `image`, not `image[]`.
-                    let part = multipart::Part::file(path).context("参考图已丢失，请重新选择")?.mime_str(mime)?;
-                    form = form.part("image", part);
+                    images.push(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
                 }
-                self.client.post(settings.endpoint("images/edits")).bearer_auth(key).multipart(form)
-                    .send().context("无法上传参考图")?
+                // Use the documented JSON data URL form: bool/number fields retain their
+                // types, and upload handling no longer depends on filenames or multipart parsing.
+                self.client.post(settings.endpoint("images/edits")).bearer_auth(key)
+                    .json(&json!({"model": settings.model, "prompt": job.prompt, "image": images,
+                        "async": true, "n": 1, "size": settings.size, "quality": settings.quality,
+                        "output_format": settings.format}))
+                    .send().context("无法提交图片编辑请求")?
             }
         };
-        response_json(response)
+        response_json(response).context(match job.mode {
+            Mode::Generate => "文生图接口提交失败",
+            Mode::Edit | Mode::Batch => "图片编辑接口提交失败",
+        })
     }
 
     fn download(&self, url: &str, job: &Job) -> Result<ImageAsset> {
@@ -276,23 +290,83 @@ fn wait(duration: Duration, canceled: &AtomicBool) -> bool {
 
 fn response_json(mut response: Response) -> Result<Value> {
     let status = response.status();
-    let mut text = String::new();
+    let request_id = ["x-request-id", "request-id", "x-correlation-id", "cf-ray"]
+        .iter()
+        .find_map(|name| response.headers().get(*name)?.to_str().ok())
+        .map(|id| format!("；请求 ID：{}", error_excerpt(id, 128)))
+        .unwrap_or_default();
+    let mut bytes = Vec::new();
     response
         .by_ref()
         .take(1024 * 1024)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .context("无法读取 API 响应")?;
+    let text = String::from_utf8_lossy(&bytes);
     let parsed: Option<Value> = serde_json::from_str(&text).ok();
     if !status.is_success() {
         let detail = parsed
             .as_ref()
-            .and_then(|v| v.pointer("/error/message").or_else(|| v.get("message")))
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .or_else(|| v.get("message"))
+                    .or_else(|| v.get("error"))
+            })
             .and_then(Value::as_str)
-            .map(|s| s.chars().take(500).collect::<String>())
-            .unwrap_or_else(|| "服务端未返回错误详情".into());
-        bail!("HTTP {}：{}", status.as_u16(), detail);
+            .unwrap_or(&text);
+        let detail = error_excerpt(detail, 600);
+        let detail = if detail.is_empty() {
+            "服务端未返回错误详情"
+        } else {
+            &detail
+        };
+        let hint = if status.as_u16() == 502 {
+            "；网关或上游服务异常。若提交时未取得任务 ID，无法确认是否已受理，请先核对服务端任务"
+        } else {
+            ""
+        };
+        bail!("HTTP {}：{}{request_id}{hint}", status.as_u16(), detail);
     }
-    parsed.context("API 返回的内容不是有效 JSON")
+    parsed.with_context(|| {
+        format!(
+            "API 返回的内容不是有效 JSON{request_id}：{}",
+            error_excerpt(&text, 600)
+        )
+    })
+}
+
+// Display bounded plain text from gateway pages, omitting tags and script/style contents.
+fn error_excerpt(source: &str, limit: usize) -> String {
+    let mut rest = source;
+    let mut visible = String::new();
+    let mut suppressed: Option<&str> = None;
+    while let Some(start) = rest.find('<') {
+        if suppressed.is_none() {
+            visible.push_str(&rest[..start]);
+            visible.push(' ');
+        }
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        let tag = rest[start + 1..start + end].trim().to_ascii_lowercase();
+        let name = tag.split_whitespace().next().unwrap_or("");
+        if matches!(name, "script" | "style") {
+            suppressed = Some(if name == "script" { "script" } else { "style" });
+        } else if suppressed.is_some_and(|name| tag == format!("/{name}")) {
+            suppressed = None;
+        }
+        rest = &rest[start + end + 1..];
+    }
+    if suppressed.is_none() {
+        visible.push_str(rest);
+    }
+    visible
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(limit)
+        .collect()
 }
 
 fn image_urls(value: &Value) -> Result<Option<Vec<String>>> {
@@ -424,6 +498,27 @@ mod tests {
             body.to_string().into_bytes(),
         )
     }
+
+    fn source_image(format: image::ImageFormat, shade: u8) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([shade, 40, 80]),
+        ))
+        .write_to(&mut bytes, format)
+        .unwrap();
+        bytes.into_inner()
+    }
+
+    fn payload(request: &str) -> Value {
+        assert!(
+            request
+                .to_lowercase()
+                .contains("content-type: application/json")
+        );
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
     fn job(base: &str, directory: &std::path::Path) -> Job {
         Job {
             drawing_id: Uuid::new_v4(),
@@ -441,6 +536,15 @@ mod tests {
 
     #[test]
     fn generation_submits_async_and_polls_statusless_result() {
+        assert_async_roundtrip(Mode::Generate);
+    }
+
+    #[test]
+    fn edit_submits_async_and_downloads_result() {
+        assert_async_roundtrip(Mode::Edit);
+    }
+
+    fn assert_async_roundtrip(mode: Mode) {
         // Bind first to construct the CDN URL using this test server's port.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -495,6 +599,12 @@ mod tests {
         api.poll_interval = Duration::ZERO;
         let mut completed = false;
         let mut request = job(&base, directory.path());
+        request.mode = mode;
+        if mode == Mode::Edit {
+            let source = directory.path().join("source.png");
+            std::fs::write(&source, source_image(image::ImageFormat::Png, 1)).unwrap();
+            request.references.push(source);
+        }
         request.settings.size = "1280x768".into();
         api.run(&request, "test-key", &AtomicBool::new(false), |event| {
             if let Event::Completed(images) = event {
@@ -507,7 +617,11 @@ mod tests {
         .unwrap();
         assert!(completed);
         let requests = handle.join().unwrap();
-        assert!(requests[0].starts_with("POST /v1/images/generations"));
+        assert!(requests[0].starts_with(if mode == Mode::Generate {
+            "POST /v1/images/generations"
+        } else {
+            "POST /v1/images/edits"
+        }));
         let payload: Value =
             serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(payload["async"], true);
@@ -523,19 +637,31 @@ mod tests {
     }
 
     #[test]
-    fn edits_upload_repeated_image_parts_and_propagate_failure() {
+    fn edits_upload_ordered_data_urls_with_typed_fields_and_propagate_failure() {
         let (base, handle) = server(vec![
             json_response(json!({"task_id":"task_edit","status":"processing"})),
             json_response(json!({"status":"failed","error":{"message":"上游生成失败"}})),
         ]);
         let directory = tempfile::tempdir().unwrap();
-        let one = directory.path().join("one.png");
-        let two = directory.path().join("two.png");
-        std::fs::write(&one, b"first image").unwrap();
-        std::fs::write(&two, b"second image").unwrap();
+        let sources = [
+            ("原图.png", image::ImageFormat::Jpeg, "image/jpeg"),
+            ("two.jpeg", image::ImageFormat::WebP, "image/webp"),
+            ("three.webp", image::ImageFormat::Png, "image/png"),
+        ];
+        let paths: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (name, format, _))| {
+                let path = directory.path().join(name);
+                std::fs::write(&path, source_image(*format, index as u8)).unwrap();
+                path
+            })
+            .collect();
         let mut request = job(&base, directory.path());
         request.mode = Mode::Edit;
-        request.references = vec![one, two];
+        request.references = paths.clone();
+        request.settings.model = "gpt-image-2.5-sunburst".into();
+        request.settings.quality = "max".into();
         let mut api = Api::new().unwrap();
         api.poll_interval = Duration::ZERO;
         let error = api
@@ -544,9 +670,25 @@ mod tests {
         assert!(error.to_string().contains("上游生成失败"));
         let requests = handle.join().unwrap();
         assert!(requests[0].starts_with("POST /v1/images/edits"));
-        assert_eq!(requests[0].matches("name=\"image\"").count(), 2);
-        assert!(requests[0].contains("name=\"async\"\r\n\r\ntrue"));
-        assert!(requests[0].contains("Content-Type: image/png"));
+        let body = payload(&requests[0]);
+        assert_eq!(body["async"], true);
+        assert_eq!(body["n"], 1);
+        assert_eq!(body["model"], "gpt-image-2.5-sunburst");
+        assert_eq!(body["quality"], "max");
+        assert_eq!(body["output_format"], "png");
+        assert!(body.get("background").is_none());
+        assert_eq!(body["image"].as_array().unwrap().len(), 3);
+        for (index, (_, _, mime)) in sources.iter().enumerate() {
+            let encoded = body["image"][index]
+                .as_str()
+                .unwrap()
+                .strip_prefix(&format!("data:{mime};base64,"))
+                .unwrap();
+            assert_eq!(
+                STANDARD.decode(encoded).unwrap(),
+                std::fs::read(&paths[index]).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -571,7 +713,7 @@ mod tests {
         let sources: Vec<_> = (0..42)
             .map(|index| {
                 let path = directory.path().join(format!("product-{index}.png"));
-                std::fs::write(&path, format!("source-{index}")).unwrap();
+                std::fs::write(&path, source_image(image::ImageFormat::Png, index)).unwrap();
                 path
             })
             .collect();
@@ -597,9 +739,18 @@ mod tests {
         assert_eq!(requests.len(), 42);
         for (index, request) in requests.iter().enumerate() {
             assert!(request.starts_with("POST /v1/images/edits"));
-            assert_eq!(request.matches("name=\"image\"").count(), 1);
-            assert!(request.contains("将背景替换为蓝色渐变，保留主体"));
-            assert!(request.contains(&format!("source-{index}\r\n")));
+            let body = payload(request);
+            assert_eq!(body["image"].as_array().unwrap().len(), 1);
+            assert_eq!(body["prompt"], "将背景替换为蓝色渐变，保留主体");
+            let encoded = body["image"][0]
+                .as_str()
+                .unwrap()
+                .strip_prefix("data:image/png;base64,")
+                .unwrap();
+            assert_eq!(
+                STANDARD.decode(encoded).unwrap(),
+                std::fs::read(&sources[index]).unwrap()
+            );
         }
     }
 
@@ -621,6 +772,8 @@ mod tests {
         let (base, handle) = server(vec![json_response(json!({"status":"expired"}))]);
         let directory = tempfile::tempdir().unwrap();
         let mut request = job(&base, directory.path());
+        request.mode = Mode::Edit;
+        request.settings.model = "gpt-image-2-vip".into();
         request.resume_task = Some("previous_task".into());
         let mut api = Api::new().unwrap();
         api.poll_interval = Duration::ZERO;
@@ -629,6 +782,79 @@ mod tests {
                 .is_err()
         );
         assert!(handle.join().unwrap()[0].starts_with("GET /v1/tasks/previous_task"));
+    }
+
+    #[test]
+    fn edits_reject_missing_invalid_and_unsupported_sources_before_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        let mut request = job("http://127.0.0.1:1", directory.path());
+        request.mode = Mode::Edit;
+        let api = Api::new().unwrap();
+        assert!(
+            api.submit(&request, "test-key")
+                .unwrap_err()
+                .to_string()
+                .contains("至少需要")
+        );
+        request.references = vec![source.clone()];
+        assert!(
+            api.submit(&request, "test-key")
+                .unwrap_err()
+                .to_string()
+                .contains("已丢失")
+        );
+        std::fs::write(&source, b"not an image").unwrap();
+        assert!(
+            api.submit(&request, "test-key")
+                .unwrap_err()
+                .to_string()
+                .contains("无法识别")
+        );
+        std::fs::write(&source, b"GIF89a").unwrap();
+        assert!(
+            api.submit(&request, "test-key")
+                .unwrap_err()
+                .to_string()
+                .contains("仅支持")
+        );
+    }
+
+    #[test]
+    fn gateway_failure_preserves_safe_details_and_never_reposts() {
+        for body in [
+            "<html><head><style>hidden-style</style></head><body><h1>502 Bad Gateway</h1><p>upstream timed out</p><script>hidden-script</script></body></html>",
+            "upstream timed out",
+        ] {
+            let (base, handle) = server(vec![(
+                502,
+                "text/html\r\nx-request-id: req-edit-502".into(),
+                body.as_bytes().to_vec(),
+            )]);
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.png");
+            std::fs::write(&source, source_image(image::ImageFormat::Png, 0)).unwrap();
+            let mut request = job(&base, directory.path());
+            request.mode = Mode::Edit;
+            request.references.push(source);
+            let error = Api::new()
+                .unwrap()
+                .run(&request, "test-key", &AtomicBool::new(false), |_| true)
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("图片编辑接口提交失败"));
+            assert!(message.contains("HTTP 502"));
+            assert!(message.contains("upstream timed out"));
+            assert!(message.contains("req-edit-502"));
+            assert!(message.contains("不会自动重新提交"));
+            assert!(!message.contains("hidden-script"));
+            assert!(!message.contains("hidden-style"));
+            assert!(!message.contains("<html>"));
+            let requests = handle.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("POST /v1/images/edits"));
+        }
+        assert_eq!(error_excerpt(&"错".repeat(1000), 600).chars().count(), 600);
     }
 
     #[test]
