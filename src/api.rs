@@ -42,8 +42,8 @@ impl Api {
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .connect_timeout(Duration::from_secs(20))
-                .timeout(Duration::from_secs(90))
+                .connect_timeout(Duration::from_secs(200))
+                .timeout(Duration::from_secs(900))
                 .user_agent("AIDRAW/0.1")
                 .build()?,
             poll_interval: Duration::from_secs(4),
