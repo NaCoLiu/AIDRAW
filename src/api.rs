@@ -14,6 +14,8 @@ use std::{
 };
 use uuid::Uuid;
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct Job {
     pub drawing_id: Uuid,
@@ -42,8 +44,9 @@ impl Api {
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .connect_timeout(Duration::from_secs(200))
-                .timeout(Duration::from_secs(900))
+                // Each HTTP request gets its own budget, including connection and upload.
+                .connect_timeout(REQUEST_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
                 .user_agent("AIDRAW/0.1")
                 .build()?,
             poll_interval: Duration::from_secs(4),
@@ -84,6 +87,7 @@ impl Api {
                 return Ok(());
             }
         }
+        // The polling budget belongs to this job and starts after submission.
         let started = Instant::now();
         let mut failures = 0;
         loop {
@@ -447,6 +451,13 @@ mod tests {
     fn server(
         responses: Vec<(u16, String, Vec<u8>)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        delayed_server(responses, Duration::ZERO)
+    }
+
+    fn delayed_server(
+        responses: Vec<(u16, String, Vec<u8>)>,
+        delay: Duration,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
@@ -483,6 +494,7 @@ mod tests {
                     headers,
                     String::from_utf8_lossy(&request_body)
                 ));
+                std::thread::sleep(delay);
                 write!(stream, "HTTP/1.1 {code} OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
                 stream.write_all(&body).unwrap();
             }
@@ -752,6 +764,39 @@ mod tests {
                 std::fs::read(&sources[index]).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn batch_request_timeouts_do_not_accumulate_across_images() {
+        let request_timeout = Duration::from_secs(1);
+        let (base, handle) = delayed_server(
+            (0..3)
+                .map(|index| {
+                    json_response(json!({"task_id": format!("batch-{index}"), "status": "queued"}))
+                })
+                .collect(),
+            Duration::from_millis(400),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, source_image(image::ImageFormat::Png, 0)).unwrap();
+        let mut request = job(&base, directory.path());
+        request.mode = Mode::Batch;
+        request.references = vec![source];
+        let mut api = Api::new().unwrap();
+        // Reuse a client to verify even consecutive requests have separate deadlines.
+        api.client = Client::builder()
+            .no_proxy()
+            .timeout(request_timeout)
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        for index in 0..3 {
+            let result = api.submit(&request, "test-key").unwrap();
+            assert_eq!(result["task_id"], format!("batch-{index}"));
+        }
+        assert!(started.elapsed() > request_timeout);
+        assert_eq!(handle.join().unwrap().len(), 3);
     }
 
     #[test]
